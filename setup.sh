@@ -6,7 +6,7 @@ echo "Install Apache PHP dan Rsyslog"
 
 apt update -y
 
-apt install apache2 php rsyslog -y
+apt install apache2 php php-mbstring rsyslog logrotate -y
 
 echo "Aktifkan Syslog UDP"
 
@@ -33,350 +33,537 @@ echo "Install Dashboard"
 
 cat > /var/www/html/index.php << 'EOF'
 <?php
-
 date_default_timezone_set('Asia/Jakarta');
 
 $logFile = '/var/log/mikrotik.log';
-$logs = [];
-$errorMessage = '';
+$maxLines = 10000;
+$maxDisplay = 500;
 
-// Membaca file Syslog
-if (!is_readable($logFile)) {
-    $errorMessage = 'File log tidak dapat dibaca. Periksa izin akses PHP.';
-} else {
-    $allLogs = file(
-        $logFile,
-        FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES
-    );
+function h($value) {
+    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+}
 
-    foreach ($allLogs as $log) {
-        if (
-            strpos($log, 'WINBOX-NEW') !== false ||
-            strpos($log, 'SSH-NEW') !== false
-        ) {
-            $logs[] = $log;
+function parseEvent($line) {
+    $line = trim($line);
+
+    // Format syslog:
+    // timestamp router-ip topics pesan
+    if (!preg_match(
+        '/^(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/',
+        $line,
+        $parts
+    )) {
+        return null;
+    }
+
+    $timestamp = $parts[1];
+    $topics = $parts[3];
+    $message = $parts[4];
+
+    // Abaikan aktivitas web-proxy
+    if (stripos($topics, 'web-proxy') !== false) {
+        return null;
+    }
+
+    $event = null;
+    $username = '-';
+    $ip = '-';
+    $service = '-';
+    $status = '';
+    $detail = $message;
+
+    // 1. Koneksi baru Winbox
+    if (preg_match('/WINBOX-NEW/i', $message)) {
+        $event = 'Koneksi';
+        $service = 'Winbox';
+        $status = 'Koneksi baru';
+    }
+    // 2. Koneksi baru SSH
+    elseif (preg_match('/SSH-NEW/i', $message)) {
+        $event = 'Koneksi';
+        $service = 'SSH';
+        $status = 'Koneksi baru';
+    }
+
+    // Ambil IP sumber dari log firewall.
+    // Contoh: 172.16.3.20:54321->172.16.15.1:8291
+    if ($event === 'Koneksi') {
+        if (preg_match(
+            '/(\d{1,3}(?:\.\d{1,3}){3}):\d+\s*->/',
+            $message,
+            $m
+        )) {
+            $ip = $m[1];
+        } elseif (preg_match(
+            '/src-address=(\d{1,3}(?:\.\d{1,3}){3})/',
+            $message,
+            $m
+        )) {
+            $ip = $m[1];
         }
     }
 
-    // Log terbaru ditampilkan lebih dahulu
-    $logs = array_reverse($logs);
-}
+    // 3. Login gagal
+    if (preg_match(
+        '/login failure for user\s+(\S+)\s+from\s+(\S+)\s+via\s+(\S+)/i',
+        $message,
+        $m
+    )) {
+        $event = 'Autentikasi';
+        $status = 'Login gagal';
+        $username = $m[1];
+        $ip = $m[2];
+        $service = $m[3];
+    }
+    // 4. Login berhasil
+    elseif (preg_match(
+        '/user\s+(\S+)\s+logged in from\s+(\S+)\s+via\s+(\S+)/i',
+        $message,
+        $m
+    )) {
+        $event = 'Autentikasi';
+        $status = 'Login berhasil';
+        $username = $m[1];
+        $ip = $m[2];
+        $service = $m[3];
+    }
+    // 5. Logout
+    elseif (preg_match(
+        '/user\s+(\S+)\s+logged out(?: from\s+(\S+))?(?:\s+via\s+(\S+))?/i',
+        $message,
+        $m
+    )) {
+        $event = 'Autentikasi';
+        $status = 'Logout';
+        $username = $m[1];
+        $ip = !empty($m[2]) ? $m[2] : '-';
+        $service = !empty($m[3]) ? $m[3] : '-';
+    }
 
-// Mengamankan teks sebelum ditampilkan ke HTML
-function e($value)
-{
-    return htmlspecialchars(
-        (string) $value,
-        ENT_QUOTES,
-        'UTF-8'
-    );
-}
+    // Abaikan semua log selain koneksi dan autentikasi.
+    if ($event === null) {
+        return null;
+    }
 
-// Mengolah satu baris Syslog
-function parseLog($log)
-{
-    $data = [
-        'waktu'       => '-',
-        'ip_sumber'   => '-',
-        'mac_sumber'  => '-',
-        'ip_tujuan'   => '-',
-        'port_tujuan' => '-',
-        'kegiatan'    => 'Aktivitas jaringan'
-    ];
-
-    // Mengambil timestamp Syslog
-// Mengambil timestamp Syslog dan mengonversinya ke WIB
-if (preg_match(
-    '/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/',
-    $log,
-    $m
-)) {
+    // Ubah timestamp ISO-8601 menjadi WIB.
     try {
-        $waktu = new DateTimeImmutable($m[1]);
-
-        $waktu = $waktu->setTimezone(
+        $date = new DateTimeImmutable($timestamp);
+        $date = $date->setTimezone(
             new DateTimeZone('Asia/Jakarta')
         );
-
-        $data['waktu'] = $waktu->format('d-m-Y H:i:s');
-
+        $time = $date->format('d-m-Y H:i:s');
     } catch (Exception $e) {
-        $data['waktu'] = 'Format waktu tidak valid';
+        $time = $timestamp;
+    }
+
+    return [
+        'timestamp' => $timestamp,
+        'waktu' => $time,
+        'event' => $event,
+        'status' => $status,
+        'username' => $username,
+        'ip' => $ip,
+        'service' => $service,
+        'detail' => $detail
+    ];
+}
+
+$filter = $_GET['jenis'] ?? 'semua';
+
+$allowedFilters = [
+    'semua',
+    'koneksi',
+    'berhasil',
+    'gagal',
+    'logout'
+];
+
+if (!in_array($filter, $allowedFilters, true)) {
+    $filter = 'semua';
+}
+
+$events = [];
+$error = '';
+
+if (!is_readable($logFile)) {
+    $error = 'File log tidak dapat dibaca. Periksa izin akses PHP.';
+} else {
+    $file = new SplFileObject($logFile, 'r');
+    $file->seek(PHP_INT_MAX);
+    $totalLines = $file->key() + 1;
+
+    $startLine = max(0, $totalLines - $maxLines);
+    $file->seek($startLine);
+
+    $lines = [];
+
+    while (!$file->eof()) {
+        $line = trim($file->fgets());
+
+        if ($line !== '') {
+            $lines[] = $line;
+        }
+    }
+
+    // Log terbaru ditampilkan paling atas.
+    foreach (array_reverse($lines) as $line) {
+        $item = parseEvent($line);
+
+        if ($item === null) {
+            continue;
+        }
+
+        $events[] = $item;
     }
 }
 
-    // Mengambil MAC address sumber jika tersedia
-    if (preg_match(
-        '/src-mac\s+([0-9a-fA-F:]{17})/',
-        $log,
-        $m
-    )) {
-        $data['mac_sumber'] = strtoupper($m[1]);
+$totalKoneksi = 0;
+$totalBerhasil = 0;
+$totalGagal = 0;
+$totalLogout = 0;
+
+foreach ($events as $item) {
+    if ($item['event'] === 'Koneksi') {
+        $totalKoneksi++;
     }
 
-    // Mengambil IP sumber, port sumber, IP tujuan, port tujuan
-    if (preg_match(
-        '/(\d{1,3}(?:\.\d{1,3}){3}):(\d+)->(\d{1,3}(?:\.\d{1,3}){3}):(\d+)/',
-        $log,
-        $m
-    )) {
-        $data['ip_sumber'] = $m[1];
-        $data['ip_tujuan'] = $m[3];
-        $data['port_tujuan'] = $m[4];
+    if ($item['status'] === 'Login berhasil') {
+        $totalBerhasil++;
     }
 
-    // Menentukan jenis aktivitas berdasarkan prefix
-    if (strpos($log, 'WINBOX-NEW') !== false) {
-        $data['kegiatan'] = 'Koneksi baru Winbox';
-    } elseif (strpos($log, 'SSH-NEW') !== false) {
-        $data['kegiatan'] = 'Koneksi baru SSH';
+    if ($item['status'] === 'Login gagal') {
+        $totalGagal++;
     }
 
-    return $data;
+    if ($item['status'] === 'Logout') {
+        $totalLogout++;
+    }
 }
 
+// Filter hanya memengaruhi tabel, bukan angka ringkasan.
+$filteredEvents = array_values(array_filter(
+    $events,
+    function ($item) use ($filter) {
+        return match ($filter) {
+            'koneksi' => $item['event'] === 'Koneksi',
+            'berhasil' => $item['status'] === 'Login berhasil',
+            'gagal' => $item['status'] === 'Login gagal',
+            'logout' => $item['status'] === 'Logout',
+            default => true
+        };
+    }
+));
+
+$filteredEvents = array_slice($filteredEvents, 0, $maxDisplay);
+
+function badgeClass($status) {
+    return match ($status) {
+        'Login berhasil' => 'success',
+        'Login gagal' => 'danger',
+        'Logout' => 'muted',
+        'Koneksi baru' => 'info',
+        default => 'muted'
+    };
+}
 ?>
-
 <!DOCTYPE html>
 <html lang="id">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<title>Monitoring MikroTik</title>
 
-    <meta http-equiv="refresh" content="10">
+<style>
+* { box-sizing: border-box; }
 
-    <title>Monitoring Akses MikroTik</title>
+body {
+    margin: 0;
+    padding: 24px;
+    background: #f1f5f9;
+    color: #1e293b;
+    font-family: Arial, Helvetica, sans-serif;
+}
 
-    <style>
-        * {
-            box-sizing: border-box;
-        }
+.container {
+    max-width: 1400px;
+    margin: auto;
+}
 
-        body {
-            font-family: Arial, sans-serif;
-            margin: 25px;
-            background: #f4f6f9;
-            color: #222;
-        }
+.header {
+    background: #172554;
+    color: white;
+    padding: 25px;
+    border-radius: 12px;
+    margin-bottom: 20px;
+}
 
-        h2 {
-            margin-bottom: 5px;
-        }
+.header h1 {
+    margin: 0 0 8px;
+    font-size: 26px;
+}
 
-        .subtitle {
-            color: #666;
-            margin-bottom: 20px;
-        }
+.header p {
+    margin: 0;
+    color: #dbeafe;
+}
 
-        .summary {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 15px;
-            margin-bottom: 20px;
-        }
+.cards {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 15px;
+    margin-bottom: 20px;
+}
 
-        .card {
-            background: #fff;
-            padding: 18px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,.06);
-            flex: 1;
-            min-width: 180px;
-        }
+.card, .panel {
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, .05);
+}
 
-        .card .label {
-            font-size: 13px;
-            color: #666;
-        }
+.card {
+    padding: 20px;
+}
 
-        .card .number {
-            display: block;
-            font-size: 27px;
-            font-weight: bold;
-            margin-top: 8px;
-        }
+.card .label {
+    color: #64748b;
+    font-size: 13px;
+}
 
-        .table-container {
-            overflow-x: auto;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,.06);
-        }
+.card .number {
+    margin-top: 10px;
+    font-size: 29px;
+    font-weight: bold;
+}
 
-        table {
-            width: 100%;
-            min-width: 900px;
-            border-collapse: collapse;
-        }
+.panel {
+    padding: 20px;
+}
 
-        th, td {
-            padding: 12px;
-            border-bottom: 1px solid #ddd;
-            text-align: left;
-            font-size: 13px;
-        }
+.panel h2 {
+    margin: 0 0 8px;
+    font-size: 20px;
+}
 
-        th {
-            background: #17365d;
-            color: white;
-        }
+.info {
+    color: #64748b;
+    font-size: 13px;
+    margin-bottom: 18px;
+    line-height: 1.6;
+}
 
-        tr:hover {
-            background: #eef5ff;
-        }
+.toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+}
 
-        .badge {
-            display: inline-block;
-            padding: 5px 8px;
-            border-radius: 5px;
-            white-space: nowrap;
-        }
+select, button {
+    padding: 10px 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    background: white;
+    color: #1e293b;
+    font-size: 14px;
+}
 
-        .winbox {
-            background: #dbeafe;
-            color: #1d4ed8;
-        }
+button {
+    background: #1d4ed8;
+    border-color: #1d4ed8;
+    color: white;
+    cursor: pointer;
+}
 
-        .ssh {
-            background: #dcfce7;
-            color: #166534;
-        }
+.table-wrap {
+    overflow-x: auto;
+}
 
-        .empty {
-            text-align: center;
-            padding: 25px;
-            color: #666;
-        }
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    white-space: nowrap;
+}
 
-        .error {
-            background: #fee2e2;
-            color: #991b1b;
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 15px;
-        }
+th, td {
+    padding: 13px 12px;
+    border-bottom: 1px solid #e2e8f0;
+    text-align: left;
+}
 
-        .footer {
-            color: #777;
-            font-size: 12px;
-            margin-top: 15px;
-        }
-    </style>
+th {
+    background: #f8fafc;
+    color: #475569;
+}
+
+.badge {
+    display: inline-block;
+    padding: 5px 9px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.success { background: #dcfce7; color: #166534; }
+.danger { background: #fee2e2; color: #991b1b; }
+.info { background: #dbeafe; color: #1d4ed8; }
+.muted { background: #e2e8f0; color: #334155; }
+
+.alert {
+    padding: 14px;
+    border-radius: 8px;
+    margin-bottom: 18px;
+    background: #fff7ed;
+    color: #9a3412;
+}
+
+.empty {
+    padding: 28px;
+    text-align: center;
+    color: #64748b;
+}
+
+.footer {
+    margin-top: 18px;
+    text-align: center;
+    color: #64748b;
+    font-size: 12px;
+}
+
+@media (max-width: 750px) {
+    body { padding: 12px; }
+    .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card { padding: 15px; }
+    .card .number { font-size: 24px; }
+    .panel { padding: 12px; }
+    .header h1 { font-size: 22px; }
+}
+</style>
 </head>
 
 <body>
+<div class="container">
 
-    <h2>Monitoring Akses MikroTik</h2>
+    <header class="header">
+        <h1>Monitoring MikroTik</h1>
+        <p>Pemantauan koneksi Winbox, SSH, dan autentikasi router</p>
+    </header>
 
-    <div class="subtitle">
-        Monitoring koneksi Winbox dan SSH melalui Syslog Debian Server
-    </div>
+    <?php if ($error !== ''): ?>
+        <div class="alert"><?= h($error) ?></div>
+    <?php endif; ?>
 
-    <?php if ($errorMessage !== ''): ?>
-
-        <div class="error">
-            <?= e($errorMessage) ?>
+    <section class="cards">
+        <div class="card">
+            <div class="label">Koneksi Baru</div>
+            <div class="number"><?= $totalKoneksi ?></div>
         </div>
 
-    <?php else: ?>
-
-        <?php
-        $totalWinbox = 0;
-        $totalSSH = 0;
-
-        foreach ($logs as $log) {
-            if (strpos($log, 'WINBOX-NEW') !== false) {
-                $totalWinbox++;
-            } elseif (strpos($log, 'SSH-NEW') !== false) {
-                $totalSSH++;
-            }
-        }
-        ?>
-
-        <div class="summary">
-            <div class="card">
-                <span class="label">Total log Winbox</span>
-                <span class="number"><?= $totalWinbox ?></span>
-            </div>
-
-            <div class="card">
-                <span class="label">Total log SSH</span>
-                <span class="number"><?= $totalSSH ?></span>
-            </div>
-
-            <div class="card">
-                <span class="label">Total aktivitas tercatat</span>
-                <span class="number"><?= count($logs) ?></span>
-            </div>
+        <div class="card">
+            <div class="label">Login Berhasil</div>
+            <div class="number"><?= $totalBerhasil ?></div>
         </div>
 
-        <div class="table-container">
+        <div class="card">
+            <div class="label">Login Gagal</div>
+            <div class="number"><?= $totalGagal ?></div>
+        </div>
+
+        <div class="card">
+            <div class="label">Logout</div>
+            <div class="number"><?= $totalLogout ?></div>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h2>Riwayat Aktivitas</h2>
+
+        <div class="info">
+            Pembaruan otomatis setiap 10 detik. Waktu ditampilkan dalam WIB.
+            Ringkasan dihitung dari log yang masih tersedia dalam file,
+            maksimal <?= number_format($maxLines) ?> baris terbaru.
+        </div>
+
+        <form method="get" class="toolbar">
+            <div>
+                <label for="jenis">Filter aktivitas: </label>
+                <select name="jenis" id="jenis" onchange="this.form.submit()">
+                    <option value="semua" <?= $filter === 'semua' ? 'selected' : '' ?>>
+                        Semua aktivitas
+                    </option>
+                    <option value="koneksi" <?= $filter === 'koneksi' ? 'selected' : '' ?>>
+                        Koneksi Winbox / SSH
+                    </option>
+                    <option value="berhasil" <?= $filter === 'berhasil' ? 'selected' : '' ?>>
+                        Login berhasil
+                    </option>
+                    <option value="gagal" <?= $filter === 'gagal' ? 'selected' : '' ?>>
+                        Login gagal
+                    </option>
+                    <option value="logout" <?= $filter === 'logout' ? 'selected' : '' ?>>
+                        Logout
+                    </option>
+                </select>
+            </div>
+
+            <button type="submit">Muat ulang</button>
+        </form>
+
+        <div class="table-wrap">
             <table>
                 <thead>
-                    <tr>
-                        <th>No</th>
-                        <th>Waktu</th>
-                        <th>IP Sumber</th>
-                        <th>MAC Sumber</th>
-                        <th>IP Tujuan</th>
-                        <th>Port Tujuan</th>
-                        <th>Nama Kegiatan</th>
-                    </tr>
+                <tr>
+                    <th>No.</th>
+                    <th>Waktu (WIB)</th>
+                    <th>Jenis</th>
+                    <th>Aktivitas</th>
+                    <th>Username</th>
+                    <th>IP Sumber</th>
+                    <th>Layanan</th>
+                    <th>Detail Log</th>
+                </tr>
                 </thead>
 
                 <tbody>
-
-                <?php if (empty($logs)): ?>
-
+                <?php if (empty($filteredEvents)): ?>
                     <tr>
-                        <td colspan="7" class="empty">
-                            Belum ada log koneksi Winbox atau SSH.
+                        <td colspan="8" class="empty">
+                            Belum ada log yang cocok dengan filter ini.
                         </td>
                     </tr>
-
                 <?php else: ?>
-
-                    <?php foreach ($logs as $i => $log): ?>
-                        <?php $item = parseLog($log); ?>
-
+                    <?php foreach ($filteredEvents as $i => $item): ?>
                         <tr>
                             <td><?= $i + 1 ?></td>
-                            <td><?= e($item['waktu']) ?></td>
-                            <td><?= e($item['ip_sumber']) ?></td>
-                            <td><?= e($item['mac_sumber']) ?></td>
-                            <td><?= e($item['ip_tujuan']) ?></td>
-                            <td><?= e($item['port_tujuan']) ?></td>
-
+                            <td><?= h($item['waktu']) ?></td>
+                            <td><?= h($item['event']) ?></td>
                             <td>
-                                <?php if (
-                                    strpos($log, 'WINBOX-NEW') !== false
-                                ): ?>
-                                    <span class="badge winbox">
-                                        <?= e($item['kegiatan']) ?>
-                                    </span>
-                                <?php else: ?>
-                                    <span class="badge ssh">
-                                        <?= e($item['kegiatan']) ?>
-                                    </span>
-                                <?php endif; ?>
+                                <span class="badge <?= badgeClass($item['status']) ?>">
+                                    <?= h($item['status']) ?>
+                                </span>
+                            </td>
+                            <td><?= h($item['username']) ?></td>
+                            <td><?= h($item['ip']) ?></td>
+                            <td><?= h($item['service']) ?></td>
+                            <td title="<?= h($item['detail']) ?>">
+                                <?= h(mb_strimwidth($item['detail'], 0, 90, '...')) ?>
                             </td>
                         </tr>
-
                     <?php endforeach; ?>
-
                 <?php endif; ?>
-
                 </tbody>
             </table>
         </div>
+    </section>
 
-        <div class="footer">
-            Halaman diperbarui otomatis setiap 10 detik.
-            Data bersumber dari file Syslog MikroTik.
-        </div>
+    <footer class="footer">
+        Monitoring MikroTik &bull; Syslog Debian 12 &bull; Refresh 10 detik
+    </footer>
 
-    <?php endif; ?>
-
+</div>
 </body>
 </html>
 EOF
